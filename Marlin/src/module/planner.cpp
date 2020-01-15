@@ -2201,6 +2201,7 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
   #endif
 
   float vmax_junction_sqr; // Initial limit on the segment entry velocity (mm/s)^2
+  
 
   #if DISABLED(CLASSIC_JERK)
     /**
@@ -2239,6 +2240,9 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
 
     // Unit vector of previous path line segment
     static xyze_float_t prev_unit_vec;
+    static float prev_mm; 
+    static float prev_junction_accel; 
+    static float prev_vmax_junction_sqr;
 
     xyze_float_t unit_vec =
       #if IS_KINEMATIC && DISABLED(CLASSIC_JERK)
@@ -2258,6 +2262,8 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
       normalize_junction_vector(unit_vec);
     #endif
 
+    const float junction_acceleration = limit_value_by_axis_maximum(block->acceleration, unit_vec);
+    
     // Skip first block or when previous_nominal_speed is used as a flag for homing and offset cycles.
     if (moves_queued && !UNEAR_ZERO(previous_nominal_speed_sqr)) {
       // Compute cosine of angle between previous and current path. (prev_unit_vec is negative)
@@ -2272,26 +2278,18 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
       }
       else {
         NOLESS(junction_cos_theta, -0.999999f); // Check for numerical round-off to avoid divide by zero.
+  
+        const float sin_theta_d2 = SQRT(0.5f * (1.0f - junction_cos_theta)), // Trig half angle identity. Always positive.
+                    R = (junction_deviation_mm * sin_theta_d2) / (1. - sin_theta_d2),
+                    vmax_this_junction_sqr = junction_acceleration*R,
+                    vmax_prev_junction_sqr = prev_junction_accel*R, 
+                    tan_theta_d2 = sin_theta_d2 / SQRT(0.5*(1.0+junction_cos_theta)),
+                    v_move_centripetal_sqr = .5 * block->millimeters * tan_theta_d2 * junction_acceleration,
+                    v_prev_move_centripetal_sqr = .5 * prev_mm * tan_theta_d2 * prev_junction_accel,
+                    v_prev_move_delta_sqr =  2.0 * prev_mm * prev_junction_accel,
+                    v_max_previous_move_sqr =  prev_vmax_junction_sqr + v_prev_move_delta_sqr;
 
-        // Convert delta vector to unit vector
-        xyze_float_t junction_unit_vec = unit_vec - prev_unit_vec;
-        normalize_junction_vector(junction_unit_vec);
-
-        const float junction_acceleration = limit_value_by_axis_maximum(block->acceleration, junction_unit_vec),
-                    sin_theta_d2 = SQRT(0.5f * (1.0f - junction_cos_theta)); // Trig half angle identity. Always positive.
-
-        vmax_junction_sqr = (junction_acceleration * junction_deviation_mm * sin_theta_d2) / (1.0f - sin_theta_d2);
-        if (block->millimeters < 1) {
-
-          // Fast acos approximation, minus the error bar to be safe
-          const float junction_theta = (RADIANS(-40) * sq(junction_cos_theta) - RADIANS(50)) * junction_cos_theta + RADIANS(90) - 0.18f;
-
-          // If angle is greater than 135 degrees (octagon), find speed for approximate arc
-          if (junction_theta > RADIANS(135)) {
-            const float limit_sqr = block->millimeters / (RADIANS(180) - junction_theta) * junction_acceleration;
-            NOMORE(vmax_junction_sqr, limit_sqr);
-          }
-        }
+        vmax_junction_sqr = _MIN(vmax_this_junction_sqr, vmax_prev_junction_sqr, v_move_centripetal_sqr, v_prev_move_centripetal_sqr, v_max_previous_move_sqr);
       }
 
       // Get the lowest speed
@@ -2301,7 +2299,9 @@ bool Planner::_populate_block(block_t * const block, bool split_move,
       vmax_junction_sqr = 0;
 
     prev_unit_vec = unit_vec;
-
+    prev_mm = block->millimeters;
+    prev_junction_accel = junction_acceleration; 
+    prev_vmax_junction_sqr = vmax_junction_sqr;
   #endif
 
   #ifdef USE_CACHED_SQRT
